@@ -15,6 +15,7 @@ using Microsoft.Agents.Core.Models;
 using Microsoft.Agents.Core.Serialization;
 using Microsoft.Extensions.AI;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Text.Json;
 
 namespace Agent365AgentFrameworkSampleAgent.Agent
@@ -256,10 +257,8 @@ namespace Agent365AgentFrameworkSampleAgent.Agent
                     var userText = turnContext.Activity.Text?.Trim() ?? string.Empty;
                     var _agent = await GetClientAgent(turnContext, turnState, _toolService, ToolAuthHandlerName);
 
-                    // Snapshot the persisted thread JSON BEFORE the run. If Purview blocks this turn
-                    // (streamedAny == false) we restore this snapshot so the blocked prompt does not
-                    // get baked into conversation history — otherwise every subsequent turn would
-                    // replay the toxic message and Purview would block it again.
+                    // Snapshot the persisted thread before the run. If Purview blocks this turn
+                    // we restore this snapshot so the blocked prompt is not baked into history.
                     string? threadSnapshot = turnState.Conversation.GetValue<string?>("conversation.threadInfo", () => null);
 
                     // Read or Create the conversation session for this conversation.
@@ -276,55 +275,30 @@ namespace Agent365AgentFrameworkSampleAgent.Agent
                         }
                     }
 
-                    // Stream the response back to the user as we receive it from the agent.
-                    // Note: we intentionally do NOT filter on response.Role here. Purview's policy
-                    // middleware emits its block / restriction message as a non-Assistant chunk
-                    // (System / Tool role). Filtering on Assistant would silently swallow that
-                    // message and the user would see nothing. Any text chunk the SDK produces is
-                    // intended for the user, so forward it all.
-                    var streamedAny = false;
-                    var assistantStreamed = false;
-                    var streamedTextBuilder = new System.Text.StringBuilder();
+                    // Stream the response back to the user. Purview wraps its block message in a
+                    // PurviewTextContent / PurviewBinaryContent (Microsoft.Agents.AI.Purview namespace);
+                    // detecting that content type tells us the turn was blocked by policy.
+                    const string PurviewContentNamespace = "Microsoft.Agents.AI.Purview";
+                    var purviewBlocked = false;
                     await foreach (var response in _agent!.RunStreamingAsync(userText, thread, cancellationToken: cancellationToken))
                     {
-                        _logger?.LogInformation(
-                            "Stream chunk: role={Role}, msgId={MsgId}, text-len={Len}, contents=[{Types}], text-preview={Preview}",
-                            response.Role,
-                            response.MessageId ?? "(null)",
-                            response.Text?.Length ?? 0,
-                            string.Join(",", (response.Contents ?? new List<AIContent>()).Select(c => c.GetType().Name)),
-                            response.Text is { Length: > 0 } t ? t.Substring(0, Math.Min(80, t.Length)) : "(empty)");
-                        if (!string.IsNullOrEmpty(response.Text))
+                        if (string.IsNullOrEmpty(response.Text))
                         {
-                            turnContext?.StreamingResponse.QueueTextChunk(response.Text);
-                            streamedTextBuilder.Append(response.Text);
-                            streamedAny = true;
-                            if (response.Role == ChatRole.Assistant)
-                            {
-                                assistantStreamed = true;
-                            }
+                            continue;
+                        }
+
+                        turnContext?.StreamingResponse.QueueTextChunk(response.Text);
+                        if (response.Contents is not null &&
+                            response.Contents.Any(c => c.GetType().FullName?.StartsWith(PurviewContentNamespace, StringComparison.Ordinal) == true))
+                        {
+                            purviewBlocked = true;
                         }
                     }
-                    var streamedText = streamedTextBuilder.ToString();
-                    _logger?.LogInformation("Turn complete: streamedAny={Streamed}, assistantStreamed={Assistant}, totalLen={Len}, preview={Preview}",
-                        streamedAny, assistantStreamed, streamedText.Length,
-                        streamedText.Length > 0 ? streamedText.Substring(0, Math.Min(120, streamedText.Length)) : "(empty)");
 
-                    // If no assistant chunk was produced (Purview blocked the prompt or the response,
-                    // emitting only a system "Prompt blocked by policies" notice), surface the block
-                    // text but DO NOT persist the new thread state — otherwise the blocked exchange
-                    // gets baked into history and Purview re-blocks every subsequent turn forever.
-                    // Restore the pre-turn snapshot to keep the conversation clean.
-                    if (!assistantStreamed)
+                    // On a Purview block, restore the pre-turn snapshot so the blocked exchange is
+                    // not persisted to history (otherwise Purview re-blocks every subsequent turn).
+                    if (purviewBlocked)
                     {
-                        if (!streamedAny)
-                        {
-                            // No text at all — keep the user from seeing the bare "No text was streamed"
-                            // exception from EndStreamAsync.
-                            turnContext?.StreamingResponse.QueueTextChunk(
-                                "No response was produced for that request. Please try rephrasing your question.");
-                        }
-
                         if (threadSnapshot is null)
                         {
                             turnState.Conversation.DeleteValue("conversation.threadInfo");
@@ -450,17 +424,21 @@ namespace Agent365AgentFrameworkSampleAgent.Agent
                 }
             }
 
-            // Create the chat agent passing in instructions and tools.
-            // NOTE: Migrated from Microsoft.Agents.AI options-based ctor (1.0-preview) to the
-            // (chatClient, instructions, name, description, tools) ctor in 1.3.0. The previous
-            // ChatMessageStoreFactory (MessageCountingChatReducer cap of 10) has been dropped —
-            // chat history is now managed via the new AgentSession / ChatHistoryProvider API.
+            // Create Chat Options with instructions, tools, and temperature.
+            var toolOptions = new ChatOptions
+            {
+                Instructions = GetAgentInstructions(displayName),
+                Temperature = (float?)0.2,
+                Tools = toolList
+            };
+
+            // Create the chat agent with the configured options.
             return new ChatClientAgent(
                     _chatClient!,
-                    instructions: GetAgentInstructions(displayName),
-                    name: null,
-                    description: null,
-                    tools: toolList)
+                    new ChatClientAgentOptions
+                    {
+                        ChatOptions = toolOptions,
+                    })
                 .AsBuilder()
                 .UseOpenTelemetry(sourceName: AgentMetrics.SourceName, (cfg) => cfg.EnableSensitiveData = true)
                 .Build();
